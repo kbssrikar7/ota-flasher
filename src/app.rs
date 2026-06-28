@@ -86,6 +86,7 @@ pub struct App {
     settings_buf: AppConfig,
     notif: Option<Notif>,
     picking_folder: bool,
+    first_run: bool,
 }
 
 impl App {
@@ -94,6 +95,10 @@ impl App {
         let (tx, rx) = mpsc::channel();
         let mqtt_client = Arc::new(Mutex::new(None::<Client>));
         let ctx = cc.egui_ctx.clone();
+
+        let needs_setup = config.worker_url.is_empty()
+            || config.worker_token.is_empty()
+            || config.mqtt_pass.is_empty();
 
         let app = Self {
             settings_buf: config.clone(),
@@ -111,9 +116,10 @@ impl App {
             deploy: None,
             show_add: false,
             add_form: AddForm::default(),
-            show_settings: false,
+            show_settings: needs_setup,
             notif: None,
             picking_folder: false,
+            first_run: needs_setup,
         };
 
         // Start MQTT
@@ -986,82 +992,128 @@ impl App {
     fn render_settings_window(&mut self, ctx: &egui::Context) {
         if !self.show_settings { return; }
 
-        let mut open     = self.show_settings;
+        let first_run = self.first_run;
+        let mut open     = if first_run { true } else { self.show_settings };
         let mut pick_root = false;
         let mut do_save  = false;
         let mut cancel   = false;
 
-        // Clone settings buffer to avoid borrow conflict in closures
         let mut s = self.settings_buf.clone();
 
-        egui::Window::new("Settings")
+        let missing_url   = s.worker_url.trim().is_empty();
+        let missing_token = s.worker_token.trim().is_empty();
+        let missing_pass  = s.mqtt_pass.trim().is_empty();
+        let can_save      = !missing_url && !missing_token && !missing_pass;
+
+        let title = if first_run { "First-Time Setup" } else { "Settings" };
+
+        let mut win = egui::Window::new(title)
             .id(egui::Id::new("settings_win"))
-            .default_size([500.0, 420.0])
+            .default_size([500.0, 480.0])
             .collapsible(false)
-            .open(&mut open)
-            .show(ctx, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    section_header(ui, "Cloudflare Worker");
-                    egui::Grid::new("cf_grid").num_columns(2).spacing([10.0, 7.0]).show(ui, |ui| {
-                        ui.label(RichText::new("Worker URL").color(MUTED));
-                        ui.add(egui::TextEdit::singleline(&mut s.worker_url)
-                            .hint_text("https://ota-api.xxx.workers.dev").desired_width(310.0));
-                        ui.end_row();
-                        ui.label(RichText::new("API Token").color(MUTED));
-                        ui.add(egui::TextEdit::singleline(&mut s.worker_token)
-                            .password(true).desired_width(310.0));
-                        ui.end_row();
-                    });
+            .resizable(false);
 
-                    ui.add_space(10.0);
-                    section_header(ui, "Arduino");
-                    egui::Grid::new("ard_grid").num_columns(2).spacing([10.0, 7.0]).show(ui, |ui| {
-                        ui.label(RichText::new("FQBN").color(MUTED));
-                        ui.add(egui::TextEdit::singleline(&mut s.fqbn)
-                            .font(FontId::monospace(12.0)).desired_width(240.0));
-                        ui.end_row();
-                        ui.label(RichText::new("Sketches root").color(MUTED));
-                        ui.horizontal(|ui| {
-                            ui.add(egui::TextEdit::singleline(&mut s.sketch_root)
-                                .font(FontId::new(11.0, FontFamily::Monospace)).desired_width(210.0));
-                            if ui.button("Browse").clicked() { pick_root = true; }
+        if !first_run {
+            win = win.open(&mut open);
+        }
+
+        win.show(ctx, |ui| {
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                if first_run {
+                    egui::Frame::default()
+                        .fill(Color32::from_rgb(30, 58, 100))
+                        .inner_margin(egui::Margin::symmetric(12.0, 8.0))
+                        .rounding(Rounding::same(6.0))
+                        .show(ui, |ui| {
+                            ui.label(RichText::new("Welcome to OTA Flasher! Fill in the required fields below to get started.").color(Color32::WHITE).size(12.5));
                         });
-                        ui.end_row();
-                    });
-
                     ui.add_space(10.0);
-                    section_header(ui, "MQTT Broker");
-                    egui::Grid::new("mqtt_grid").num_columns(2).spacing([10.0, 7.0]).show(ui, |ui| {
-                        ui.label(RichText::new("Host").color(MUTED));
-                        ui.add(egui::TextEdit::singleline(&mut s.mqtt_host).desired_width(240.0));
-                        ui.end_row();
-                        ui.label(RichText::new("Port").color(MUTED));
-                        let mut port_s = s.mqtt_port.to_string();
-                        if ui.add(egui::TextEdit::singleline(&mut port_s).desired_width(80.0)).changed() {
-                            if let Ok(p) = port_s.parse::<u16>() { s.mqtt_port = p; }
-                        }
-                        ui.end_row();
-                        ui.label(RichText::new("User").color(MUTED));
-                        ui.add(egui::TextEdit::singleline(&mut s.mqtt_user).desired_width(180.0));
-                        ui.end_row();
-                        ui.label(RichText::new("Password").color(MUTED));
-                        ui.add(egui::TextEdit::singleline(&mut s.mqtt_pass).password(true).desired_width(180.0));
-                        ui.end_row();
-                    });
+                }
 
-                    ui.add_space(14.0);
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
-                        let btn = egui::Button::new(RichText::new("Save & Apply").color(Color32::WHITE)).fill(PRIMARY);
-                        if ui.add(btn).clicked() { do_save = true; }
+                section_header(ui, "Cloudflare Worker");
+                egui::Grid::new("cf_grid").num_columns(2).spacing([10.0, 7.0]).show(ui, |ui| {
+                    let url_label = if missing_url {
+                        RichText::new("Worker URL *").color(DANGER)
+                    } else {
+                        RichText::new("Worker URL *").color(MUTED)
+                    };
+                    ui.label(url_label);
+                    ui.add(egui::TextEdit::singleline(&mut s.worker_url)
+                        .hint_text("https://ota-api.xxx.workers.dev").desired_width(310.0));
+                    ui.end_row();
+                    let tok_label = if missing_token {
+                        RichText::new("API Token *").color(DANGER)
+                    } else {
+                        RichText::new("API Token *").color(MUTED)
+                    };
+                    ui.label(tok_label);
+                    ui.add(egui::TextEdit::singleline(&mut s.worker_token)
+                        .password(true).desired_width(310.0));
+                    ui.end_row();
+                });
+
+                ui.add_space(10.0);
+                section_header(ui, "Arduino");
+                egui::Grid::new("ard_grid").num_columns(2).spacing([10.0, 7.0]).show(ui, |ui| {
+                    ui.label(RichText::new("FQBN").color(MUTED));
+                    ui.add(egui::TextEdit::singleline(&mut s.fqbn)
+                        .font(FontId::monospace(12.0)).desired_width(240.0));
+                    ui.end_row();
+                    ui.label(RichText::new("Sketches root").color(MUTED));
+                    ui.horizontal(|ui| {
+                        ui.add(egui::TextEdit::singleline(&mut s.sketch_root)
+                            .font(FontId::new(11.0, FontFamily::Monospace)).desired_width(210.0));
+                        if ui.button("Browse").clicked() { pick_root = true; }
+                    });
+                    ui.end_row();
+                });
+
+                ui.add_space(10.0);
+                section_header(ui, "MQTT Broker");
+                egui::Grid::new("mqtt_grid").num_columns(2).spacing([10.0, 7.0]).show(ui, |ui| {
+                    ui.label(RichText::new("Host").color(MUTED));
+                    ui.add(egui::TextEdit::singleline(&mut s.mqtt_host).desired_width(240.0));
+                    ui.end_row();
+                    ui.label(RichText::new("Port").color(MUTED));
+                    let mut port_s = s.mqtt_port.to_string();
+                    if ui.add(egui::TextEdit::singleline(&mut port_s).desired_width(80.0)).changed() {
+                        if let Ok(p) = port_s.parse::<u16>() { s.mqtt_port = p; }
+                    }
+                    ui.end_row();
+                    ui.label(RichText::new("User").color(MUTED));
+                    ui.add(egui::TextEdit::singleline(&mut s.mqtt_user).desired_width(180.0));
+                    ui.end_row();
+                    let pass_label = if missing_pass {
+                        RichText::new("Password *").color(DANGER)
+                    } else {
+                        RichText::new("Password *").color(MUTED)
+                    };
+                    ui.label(pass_label);
+                    ui.add(egui::TextEdit::singleline(&mut s.mqtt_pass).password(true).desired_width(180.0));
+                    ui.end_row();
+                });
+
+                if first_run && !can_save {
+                    ui.add_space(8.0);
+                    ui.label(RichText::new("* Required fields must be filled before you can continue.").color(DANGER).size(11.0));
+                }
+
+                ui.add_space(14.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
+                    let save_btn = egui::Button::new(RichText::new("Save & Apply").color(Color32::WHITE)).fill(
+                        if can_save { PRIMARY } else { Color32::from_rgb(60, 60, 70) }
+                    );
+                    if ui.add_enabled(can_save, save_btn).clicked() { do_save = true; }
+                    if !first_run {
                         ui.add_space(8.0);
                         if ui.button("Cancel").clicked() { cancel = true; }
-                    });
+                    }
                 });
             });
+        });
 
-        // Write back
         self.settings_buf = s;
-        self.show_settings = open;
+        if !first_run { self.show_settings = open; }
 
         if pick_root { self.pick_folder(FolderPickCtx::SettingsSketchRoot); }
         if cancel    { self.show_settings = false; }
@@ -1069,6 +1121,7 @@ impl App {
             self.config = self.settings_buf.clone();
             save_config(&self.config);
             self.show_settings = false;
+            self.first_run = false;
             if !self.config.worker_url.is_empty() { self.load_fleet(); }
             self.notify("Settings saved. Reconnecting MQTT…", false);
             *self.mqtt_client.lock().unwrap() = None;
