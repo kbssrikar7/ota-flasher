@@ -71,7 +71,7 @@ impl Default for AppConfig {
             mqtt_host: "mqtt.vitalitysoft.com".to_string(),
             mqtt_port: 8883,
             mqtt_user: "solar".to_string(),
-            mqtt_pass: "".to_string(),
+            mqtt_pass: String::new(),
         }
     }
 }
