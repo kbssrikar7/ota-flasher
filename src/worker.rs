@@ -54,16 +54,19 @@ pub async fn upload_firmware(
         .text("version", version)
         .part("file", part);
 
-    let resp: serde_json::Value = reqwest::Client::new()
+    let http_resp = reqwest::Client::new()
         .post(format!("{}/upload", worker_url))
         .header("Authorization", format!("Bearer {}", token))
         .multipart(form)
         .send()
         .await
-        .map_err(|e| e.to_string())?
-        .json()
-        .await
         .map_err(|e| e.to_string())?;
+
+    if !http_resp.status().is_success() {
+        return Err(format!("HTTP {} uploading firmware", http_resp.status()));
+    }
+
+    let resp: serde_json::Value = http_resp.json().await.map_err(|e| e.to_string())?;
 
     resp["url"]
         .as_str()
@@ -71,12 +74,3 @@ pub async fn upload_firmware(
         .map(|s| s.to_string())
 }
 
-pub async fn delete_firmware(filename: String, worker_url: String, token: String) -> Result<(), String> {
-    reqwest::Client::new()
-        .delete(format!("{}/firmware/{}", worker_url, filename))
-        .header("Authorization", format!("Bearer {}", token))
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(())
-}

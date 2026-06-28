@@ -95,7 +95,7 @@ impl App {
         let mqtt_client = Arc::new(Mutex::new(None::<Client>));
         let ctx = cc.egui_ctx.clone();
 
-        let mut app = Self {
+        let app = Self {
             settings_buf: config.clone(),
             config: config.clone(),
             fleet: FleetState::default(),
@@ -171,7 +171,7 @@ impl App {
         let current = compile::read_firmware_version(
             &std::path::Path::new(&sketch_dir).join(format!("{}.ino", std::path::Path::new(&sketch_dir).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()))
         ).unwrap_or_else(|| device.desired_version.clone());
-        let next = bump_minor(&current);
+        let next = bump_patch(&current);
 
         self.deploy = Some(DeployState {
             device_id: device.id.clone(),
@@ -266,7 +266,7 @@ impl App {
                     if let Some(d) = &mut self.deploy {
                         if d.phase == DeployPhase::Waiting && d.device_id == device_id {
                             let expected = format!("ONLINE v{}", d.new_version);
-                            if status.starts_with(&expected) || status == expected {
+                            if status == expected || status.starts_with(&format!("{} ", expected)) {
                                 d.phase = DeployPhase::Done;
                                 d.log_lines.push((
                                     format!("✓ Device confirmed: {}", status),
@@ -434,6 +434,7 @@ impl App {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         // Settings
                         if ui.button("⚙  Settings").clicked() {
+                            self.show_add = false;
                             self.settings_buf = self.config.clone();
                             self.show_settings = true;
                         }
@@ -444,6 +445,7 @@ impl App {
                         let btn = egui::Button::new(RichText::new("+ Add Device").color(Color32::WHITE))
                             .fill(PRIMARY);
                         if ui.add(btn).clicked() {
+                            self.show_settings = false;
                             self.add_form = AddForm {
                                 version: "1.0.0".to_string(),
                                 device_id: suggest_next_id(&self.fleet.devices),
@@ -462,9 +464,9 @@ impl App {
 
                         // MQTT indicator
                         let (dot, txt, col) = if self.mqtt_connected {
-                            ("●", "MQTT connected", SUCCESS)
+                            ("[+]", "MQTT connected", SUCCESS)
                         } else {
-                            ("○", "MQTT offline", MUTED)
+                            ("[ ]", "MQTT offline", MUTED)
                         };
                         ui.colored_label(col, format!("{} {}", dot, txt));
 
@@ -501,6 +503,7 @@ impl App {
                     ui.label(RichText::new(&msg).color(Color32::WHITE).size(13.0));
                 });
             });
+        ctx.request_repaint_after(std::time::Duration::from_secs(1));
     }
 
     // ── Tab bar ───────────────────────────────────────────────────────────────
@@ -1120,12 +1123,13 @@ fn parse_version_from_status(status: &str) -> Option<String> {
     Some(status["ONLINE v".len()..].split_whitespace().next()?.to_string())
 }
 
-fn bump_minor(ver: &str) -> String {
+fn bump_patch(ver: &str) -> String {
     let parts: Vec<&str> = ver.split('.').collect();
     if parts.len() < 3 { return format!("{}.1", ver); }
     let patch: u32 = parts[2].parse().unwrap_or(0);
     format!("{}.{}.{}", parts[0], parts[1], patch + 1)
 }
+
 
 fn suggest_next_id(devices: &[Device]) -> String {
     let re = regex::Regex::new(r"^([a-zA-Z]+)(\d+)$").unwrap();
