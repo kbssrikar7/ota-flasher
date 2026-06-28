@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::PathBuf,
     sync::{Arc, Mutex, mpsc, atomic::{AtomicBool, AtomicU64, Ordering}},
     time::Instant,
@@ -51,6 +51,7 @@ struct AddForm {
     device_id: String,
     sketch_dir: String,
     version: String,
+    tags_input: String,
     error: String,
 }
 
@@ -88,6 +89,10 @@ pub struct App {
     picking_folder: Arc<AtomicBool>,
     mqtt_gen: Arc<AtomicU64>,
     first_run: bool,
+    search_query: String,
+    view_mode: ViewMode,
+    selected: HashSet<String>,
+    bulk_deploy: Option<BulkDeployState>,
 }
 
 impl App {
@@ -122,6 +127,10 @@ impl App {
             picking_folder: Arc::new(AtomicBool::new(false)),
             mqtt_gen: Arc::new(AtomicU64::new(0)),
             first_run: needs_setup,
+            search_query: String::new(),
+            view_mode: ViewMode::Cards,
+            selected: HashSet::new(),
+            bulk_deploy: None,
         };
 
         // Start MQTT
@@ -245,6 +254,103 @@ impl App {
 
     fn notify(&mut self, msg: impl Into<String>, is_err: bool) {
         self.notif = Some(Notif { msg: msg.into(), is_err, at: Instant::now() });
+    }
+
+    fn open_bulk_deploy_form(&mut self) {
+        if self.selected.is_empty() { return; }
+        // Collect selected devices that exist in fleet
+        let devices: Vec<&crate::types::Device> = self.fleet.devices.iter()
+            .filter(|d| self.selected.contains(&d.id))
+            .collect();
+        if devices.is_empty() { return; }
+
+        // Build per-device entries
+        let dev_entries: Vec<DeviceBulkDeploy> = devices.iter().map(|d| DeviceBulkDeploy {
+            device_id: d.id.clone(),
+            device_name: d.name.clone(),
+            sketch_dir: if d.sketch_dir.is_empty() {
+                default_sketch_dir(&self.config.sketch_root, &d.id)
+            } else {
+                resolve_sketch_dir(&self.config.sketch_root, &d.sketch_dir)
+            },
+            phase: DeployPhase::Form,
+            log: vec![],
+        }).collect();
+
+        // Use the first device's desired version as a suggestion
+        let suggested_ver = devices.first()
+            .and_then(|d| if d.desired_version.is_empty() { None } else { Some(bump_patch(&d.desired_version)) })
+            .unwrap_or_else(|| "1.0.0".to_string());
+
+        self.bulk_deploy = Some(BulkDeployState {
+            deployer_name: String::new(),
+            new_version: suggested_ver.clone(),
+            devices: dev_entries,
+            sketch_builds: HashMap::new(),
+            form_deployer: String::new(),
+            form_version: suggested_ver,
+            show_form: true,
+        });
+    }
+
+    fn start_bulk_deploy(&mut self) {
+        let bd = match &mut self.bulk_deploy {
+            Some(bd) => bd,
+            None => return,
+        };
+        if bd.deployer_name.trim().is_empty() || bd.new_version.trim().is_empty() { return; }
+
+        bd.show_form = false;
+        let version = bd.new_version.clone();
+        let fqbn    = self.config.fqbn.clone();
+
+        // Group devices by sketch_dir, compile each unique sketch once
+        let mut sketch_dirs: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for dev in &bd.devices {
+            sketch_dirs.insert(dev.sketch_dir.clone());
+        }
+
+        for sketch_dir in sketch_dirs {
+            bd.sketch_builds.insert(sketch_dir.clone(), SketchBuildState::Compiling);
+            // Update all devices that use this sketch to Compiling
+            for dev in bd.devices.iter_mut() {
+                if dev.sketch_dir == sketch_dir {
+                    dev.phase = DeployPhase::Compiling;
+                }
+            }
+            let tx  = self.event_tx.clone();
+            let ctx = self.egui_ctx.clone();
+            let ver = version.clone();
+            let fqbn2 = fqbn.clone();
+            let sketch_dir2 = sketch_dir.clone();
+            std::thread::spawn(move || {
+                // Reuse compile_sketch but send BulkCompileDone instead of CompileDone
+                // We need a wrapper that translates the events
+                let (inner_tx, inner_rx) = std::sync::mpsc::channel::<AppEvent>();
+                let inner_tx2 = inner_tx.clone();
+                let inner_ctx = ctx.clone();
+                std::thread::spawn(move || {
+                    compile::compile_sketch(sketch_dir2.clone(), ver, fqbn2, inner_tx2, inner_ctx);
+                });
+                let mut bin_path: Option<PathBuf> = None;
+                let mut success = false;
+                for ev in inner_rx {
+                    match ev {
+                        AppEvent::CompileOutput { line, level } => {
+                            tx.send(AppEvent::CompileOutput { line, level }).ok();
+                        }
+                        AppEvent::CompileDone { success: s, bin_path: bp } => {
+                            success = s;
+                            bin_path = bp;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                tx.send(AppEvent::BulkCompileDone { sketch_dir, success, bin_path }).ok();
+                ctx.request_repaint();
+            });
+        }
     }
 
     // ── Event processing ──────────────────────────────────────────────────────
@@ -395,6 +501,81 @@ impl App {
                     }
                     self.picking_folder.store(false, Ordering::SeqCst);
                 }
+                AppEvent::BulkCompileDone { sketch_dir, success, bin_path } => {
+                    if let Some(bd) = &mut self.bulk_deploy {
+                        if success {
+                            if let Some(path) = bin_path {
+                                bd.sketch_builds.insert(sketch_dir.clone(), SketchBuildState::Uploading);
+                                for dev in bd.devices.iter_mut() {
+                                    if dev.sketch_dir == sketch_dir {
+                                        dev.phase = DeployPhase::Uploading;
+                                    }
+                                }
+                                let tx2 = self.event_tx.clone();
+                                let sketch_name = std::path::Path::new(&sketch_dir)
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().to_string())
+                                    .unwrap_or_else(|| "sketch".to_string());
+                                let version = bd.new_version.clone();
+                                let worker_url = self.config.worker_url.clone();
+                                let token = self.config.worker_token.clone();
+                                let sketch_dir2 = sketch_dir.clone();
+                                self.rt.spawn(async move {
+                                    match worker::upload_firmware(path, sketch_name, version, worker_url, token).await {
+                                        Ok(url) => { tx2.send(AppEvent::BulkUploadDone { sketch_dir: sketch_dir2, url }).ok(); }
+                                        Err(e)  => { tx2.send(AppEvent::Error(format!("Bulk upload: {}", e))).ok(); }
+                                    }
+                                });
+                            }
+                        } else {
+                            bd.sketch_builds.insert(sketch_dir.clone(), SketchBuildState::Failed("Compile failed".to_string()));
+                            for dev in bd.devices.iter_mut() {
+                                if dev.sketch_dir == sketch_dir {
+                                    dev.phase = DeployPhase::Failed("Compile failed".to_string());
+                                }
+                            }
+                        }
+                        self.egui_ctx.request_repaint();
+                    }
+                }
+                AppEvent::BulkUploadDone { sketch_dir, url } => {
+                    if let Some(bd) = &mut self.bulk_deploy {
+                        bd.sketch_builds.insert(sketch_dir.clone(), SketchBuildState::Uploaded(url.clone()));
+                        // OTA trigger all devices that use this sketch
+                        let device_ids: Vec<String> = bd.devices.iter()
+                            .filter(|d| d.sketch_dir == sketch_dir)
+                            .map(|d| d.device_id.clone())
+                            .collect();
+                        for dev in bd.devices.iter_mut() {
+                            if dev.sketch_dir == sketch_dir {
+                                dev.phase = DeployPhase::Publishing;
+                            }
+                        }
+                        // Publish OTA trigger for each device
+                        if let Some(client) = self.mqtt_client.lock().unwrap().as_ref() {
+                            for did in &device_ids {
+                                let topic = format!("solar/{}/ota", did);
+                                let _ = client.publish(&topic, QoS::AtLeastOnce, false, url.as_bytes());
+                            }
+                        }
+                        for dev in bd.devices.iter_mut() {
+                            if dev.sketch_dir == sketch_dir {
+                                dev.phase = DeployPhase::Waiting;
+                            }
+                        }
+                        self.egui_ctx.request_repaint();
+                    }
+                }
+                AppEvent::BulkOtaPublished { device_id } => {
+                    if let Some(bd) = &mut self.bulk_deploy {
+                        for dev in bd.devices.iter_mut() {
+                            if dev.device_id == device_id {
+                                dev.phase = DeployPhase::Done;
+                            }
+                        }
+                        self.egui_ctx.request_repaint();
+                    }
+                }
             }
         }
     }
@@ -473,6 +654,17 @@ impl App {
                             self.show_add = true;
                         }
 
+                        // Bulk deploy button — visible only when devices are selected
+                        if !self.selected.is_empty() {
+                            ui.add_space(8.0);
+                            let label = format!("Deploy {} devices", self.selected.len());
+                            let btn = egui::Button::new(RichText::new(&label).color(Color32::WHITE).size(13.0))
+                                .fill(Color32::from_rgb(180, 80, 80));
+                            if ui.add(btn).clicked() {
+                                self.open_bulk_deploy_form();
+                            }
+                        }
+
                         ui.add_space(16.0);
 
                         // MQTT indicator
@@ -541,16 +733,78 @@ impl App {
         ui.add_space(10.0);
     }
 
+    // ── Search bar + view toggle ──────────────────────────────────────────────
+
+    fn render_toolbar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            let search = egui::TextEdit::singleline(&mut self.search_query)
+                .hint_text("Search by name or ID…")
+                .desired_width(260.0);
+            ui.add(search);
+
+            if !self.search_query.is_empty() {
+                if ui.small_button("✕").clicked() {
+                    self.search_query.clear();
+                }
+            }
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let list_active = self.view_mode == ViewMode::List;
+                let card_active = self.view_mode == ViewMode::Cards;
+
+                let list_btn = egui::Button::new(RichText::new("List").size(12.0))
+                    .fill(if list_active { PRIMARY } else { SURFACE })
+                    .stroke(Stroke::new(1.0, if list_active { PRIMARY } else { BORDER }));
+                if ui.add(list_btn).clicked() { self.view_mode = ViewMode::List; }
+
+                let card_btn = egui::Button::new(RichText::new("Cards").size(12.0))
+                    .fill(if card_active { PRIMARY } else { SURFACE })
+                    .stroke(Stroke::new(1.0, if card_active { PRIMARY } else { BORDER }));
+                if ui.add(card_btn).clicked() { self.view_mode = ViewMode::Cards; }
+
+                ui.label(RichText::new("View:").size(12.0).color(MUTED));
+            });
+        });
+        ui.add_space(10.0);
+    }
+
+    fn filtered_devices(&self) -> Vec<Device> {
+        let q = self.search_query.trim().to_lowercase();
+        if q.is_empty() {
+            self.fleet.devices.clone()
+        } else {
+            self.fleet.devices.iter().filter(|d| {
+                d.name.to_lowercase().contains(&q)
+                    || d.id.to_lowercase().contains(&q)
+                    || d.company.to_lowercase().contains(&q)
+                    || d.tags.iter().any(|t| t.to_lowercase().contains(&q))
+            }).cloned().collect()
+        }
+    }
+
     // ── Device grid ───────────────────────────────────────────────────────────
 
     fn render_devices(&mut self, ui: &mut egui::Ui) {
-        if self.fleet.devices.is_empty() {
+        self.render_toolbar(ui);
+
+        let devices = self.filtered_devices();
+
+        if devices.is_empty() {
             ui.add_space(60.0);
             ui.vertical_centered(|ui| {
-                ui.colored_label(MUTED, RichText::new("No devices yet").size(16.0));
-                ui.add_space(8.0);
-                ui.colored_label(MUTED, "Click  + Add Device  to register your first ESP32.");
+                if self.fleet.devices.is_empty() {
+                    ui.colored_label(MUTED, RichText::new("No devices yet").size(16.0));
+                    ui.add_space(8.0);
+                    ui.colored_label(MUTED, "Click  + Add Device  to register your first ESP32.");
+                } else {
+                    ui.colored_label(MUTED, RichText::new("No devices match your search").size(16.0));
+                }
             });
+            return;
+        }
+
+        if self.view_mode == ViewMode::List {
+            self.render_devices_list(ui, &devices);
             return;
         }
 
@@ -559,7 +813,6 @@ impl App {
         let gap = 12.0;
         let card_w = (available_w - gap * (cols as f32 - 1.0)) / cols as f32;
 
-        let devices: Vec<Device> = self.fleet.devices.clone();
         for chunk in devices.chunks(cols) {
             ui.horizontal(|ui| {
                 for (i, device) in chunk.iter().enumerate() {
@@ -577,6 +830,167 @@ impl App {
             });
             ui.add_space(10.0);
         }
+    }
+
+    fn render_devices_list(&mut self, ui: &mut egui::Ui, devices: &[Device]) {
+        // Select-all / clear controls
+        let all_ids: HashSet<String> = devices.iter().map(|d| d.id.clone()).collect();
+        let all_selected = !all_ids.is_empty() && all_ids.iter().all(|id| self.selected.contains(id));
+
+        ui.horizontal(|ui| {
+            let mut all = all_selected;
+            if ui.checkbox(&mut all, "").changed() {
+                if all {
+                    for id in &all_ids { self.selected.insert(id.clone()); }
+                } else {
+                    for id in &all_ids { self.selected.remove(id); }
+                }
+            }
+            ui.label(RichText::new("Select all visible").size(12.0).color(MUTED));
+            if !self.selected.is_empty() {
+                ui.add_space(8.0);
+                if ui.small_button("Clear selection").clicked() {
+                    self.selected.clear();
+                }
+                ui.add_space(4.0);
+                ui.label(RichText::new(format!("{} selected", self.selected.len())).size(12.0).color(PRIMARY));
+            }
+        });
+        ui.add_space(4.0);
+
+        // Header row
+        egui::Frame {
+            fill: SURFACE,
+            stroke: Stroke::new(1.0, BORDER),
+            rounding: Rounding::same(4.0),
+            inner_margin: Margin::symmetric(10.0, 6.0),
+            ..Default::default()
+        }.show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.add_space(24.0); // checkbox column width
+                ui.allocate_ui(egui::vec2(200.0, 0.0), |ui| {
+                    ui.label(RichText::new("Name").size(11.0).color(MUTED).strong());
+                });
+                ui.allocate_ui(egui::vec2(110.0, 0.0), |ui| {
+                    ui.label(RichText::new("ID").size(11.0).color(MUTED).strong());
+                });
+                ui.allocate_ui(egui::vec2(100.0, 0.0), |ui| {
+                    ui.label(RichText::new("Company").size(11.0).color(MUTED).strong());
+                });
+                ui.allocate_ui(egui::vec2(70.0, 0.0), |ui| {
+                    ui.label(RichText::new("Status").size(11.0).color(MUTED).strong());
+                });
+                ui.allocate_ui(egui::vec2(90.0, 0.0), |ui| {
+                    ui.label(RichText::new("Deployed").size(11.0).color(MUTED).strong());
+                });
+                ui.allocate_ui(egui::vec2(90.0, 0.0), |ui| {
+                    ui.label(RichText::new("Running").size(11.0).color(MUTED).strong());
+                });
+            });
+        });
+        ui.add_space(2.0);
+
+        let devices_cloned: Vec<Device> = devices.to_vec();
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for (row_idx, device) in devices_cloned.iter().enumerate() {
+                let raw_status = self.mqtt_status.get(&device.id).cloned().unwrap_or_default();
+                let is_online  = raw_status.starts_with("ONLINE");
+                let reported   = parse_version_from_status(&raw_status);
+
+                let row_bg = if row_idx % 2 == 0 { CARD } else { Color32::from_rgb(20, 23, 30) };
+                egui::Frame {
+                    fill: row_bg,
+                    stroke: Stroke::new(1.0, BORDER),
+                    rounding: Rounding::same(4.0),
+                    inner_margin: Margin::symmetric(10.0, 5.0),
+                    ..Default::default()
+                }.show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        // Checkbox
+                        let mut checked = self.selected.contains(&device.id);
+                        if ui.checkbox(&mut checked, "").changed() {
+                            if checked {
+                                self.selected.insert(device.id.clone());
+                            } else {
+                                self.selected.remove(&device.id);
+                            }
+                        }
+                        // Name + tags
+                        ui.allocate_ui(egui::vec2(200.0, 0.0), |ui| {
+                            ui.vertical(|ui| {
+                                ui.label(RichText::new(&device.name).size(13.0).color(TEXT));
+                                if !device.tags.is_empty() {
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 4.0;
+                                        for tag in &device.tags {
+                                            egui::Frame {
+                                                fill: Color32::from_rgb(40, 60, 100),
+                                                rounding: Rounding::same(3.0),
+                                                inner_margin: Margin::symmetric(4.0, 1.0),
+                                                ..Default::default()
+                                            }.show(ui, |ui| {
+                                                ui.label(RichText::new(tag).size(10.0).color(PRIMARY));
+                                            });
+                                        }
+                                    });
+                                }
+                            });
+                        });
+                        // ID
+                        ui.allocate_ui(egui::vec2(110.0, 0.0), |ui| {
+                            ui.label(Self::label_mono(&device.id, MUTED));
+                        });
+                        // Company
+                        ui.allocate_ui(egui::vec2(100.0, 0.0), |ui| {
+                            if !device.company.is_empty() {
+                                ui.label(RichText::new(&device.company).size(12.0).color(MUTED));
+                            }
+                        });
+                        // Status
+                        ui.allocate_ui(egui::vec2(70.0, 0.0), |ui| {
+                            let (dot, col, label) = if is_online {
+                                ("●", SUCCESS, "Online")
+                            } else {
+                                ("○", MUTED, "Offline")
+                            };
+                            ui.label(RichText::new(format!("{} {}", dot, label)).size(12.0).color(col));
+                        });
+                        // Deployed version
+                        ui.allocate_ui(egui::vec2(90.0, 0.0), |ui| {
+                            let deployed = if device.desired_version.is_empty() {
+                                "—".to_string()
+                            } else {
+                                format!("v{}", device.desired_version)
+                            };
+                            ui.label(Self::label_mono(deployed, TEXT));
+                        });
+                        // Running version
+                        ui.allocate_ui(egui::vec2(90.0, 0.0), |ui| {
+                            if let Some(rv) = &reported {
+                                let same = rv == &device.desired_version;
+                                let (col, mark) = if same { (SUCCESS, "✓") } else { (WARNING, "⚠") };
+                                ui.label(RichText::new(format!("v{} {}", rv, mark)).size(12.0).color(col));
+                            } else {
+                                ui.label(Self::label_mono("—", MUTED));
+                            }
+                        });
+                        // Deploy button — right-aligned
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let btn = egui::Button::new(
+                                RichText::new("Deploy").size(12.0).color(Color32::WHITE)
+                            ).fill(PRIMARY).min_size(egui::vec2(60.0, 22.0));
+                            if ui.add(btn).clicked() {
+                                let dev = device.clone();
+                                self.open_deploy(&dev);
+                            }
+                        });
+                    });
+                });
+                ui.add_space(2.0);
+            }
+        });
     }
 
     fn render_device_card(&mut self, ui: &mut egui::Ui, device: &Device) {
@@ -601,6 +1015,22 @@ impl App {
 
             ui.add_space(4.0);
             ui.label(Self::label_mono(format!("solar/{}/…", device.id), MUTED));
+            if !device.tags.is_empty() {
+                ui.add_space(4.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    for tag in &device.tags {
+                        egui::Frame {
+                            fill: Color32::from_rgb(40, 60, 100),
+                            rounding: Rounding::same(3.0),
+                            inner_margin: Margin::symmetric(5.0, 2.0),
+                            ..Default::default()
+                        }.show(ui, |ui| {
+                            ui.label(RichText::new(tag).size(10.0).color(PRIMARY));
+                        });
+                    }
+                });
+            }
             ui.add_space(10.0);
             ui.separator();
             ui.add_space(8.0);
@@ -876,6 +1306,7 @@ impl App {
         let mut device_id   = self.add_form.device_id.clone();
         let mut version     = self.add_form.version.clone();
         let mut sketch_dir  = self.add_form.sketch_dir.clone();
+        let mut tags_input  = self.add_form.tags_input.clone();
         let error           = self.add_form.error.clone();
 
         egui::Window::new("Add Device")
@@ -917,6 +1348,12 @@ impl App {
                             if ui.button("Browse").clicked() { pick_f = true; }
                         });
                         ui.end_row();
+
+                        ui.label(RichText::new("Tags").color(MUTED));
+                        ui.add(egui::TextEdit::singleline(&mut tags_input)
+                            .hint_text("RS485, Floor 1 (comma-separated)")
+                            .desired_width(240.0));
+                        ui.end_row();
                     });
 
                 if !device_id.is_empty() {
@@ -951,6 +1388,7 @@ impl App {
         self.add_form.device_id   = device_id;
         self.add_form.version     = version;
         self.add_form.sketch_dir  = sketch_dir;
+        self.add_form.tags_input  = tags_input;
 
         self.show_add = open;
 
@@ -985,6 +1423,10 @@ impl App {
             last_deploy_by: String::new(),
             added_by: f.by_name.trim().to_string(),
             added_at: chrono::Utc::now().to_rfc3339(),
+            tags: f.tags_input.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
         };
 
         self.fleet.devices.push(device);
@@ -1167,6 +1609,188 @@ impl eframe::App for App {
         self.render_deploy_window(ctx);
         self.render_add_window(ctx);
         self.render_settings_window(ctx);
+        self.render_bulk_deploy_window(ctx);
+    }
+}
+
+impl App {
+    // ── Bulk deploy window ────────────────────────────────────────────────────
+
+    fn render_bulk_deploy_window(&mut self, ctx: &egui::Context) {
+        if self.bulk_deploy.is_none() { return; }
+
+        let bd = self.bulk_deploy.as_ref().unwrap();
+        let show_form = bd.show_form;
+        let n = bd.devices.len();
+
+        if show_form {
+            // ── Form: enter deployer name + version before starting
+            let mut deployer = bd.form_deployer.clone();
+            let mut version  = bd.form_version.clone();
+            let mut do_start = false;
+            let mut do_cancel = false;
+
+            egui::Window::new(format!("Bulk Deploy — {} devices", n))
+                .id(egui::Id::new("bulk_form_win"))
+                .default_size([400.0, 200.0])
+                .collapsible(false)
+                .show(ctx, |ui| {
+                    egui::Grid::new("bulk_form_grid")
+                        .num_columns(2)
+                        .spacing([12.0, 8.0])
+                        .show(ui, |ui| {
+                            ui.label(RichText::new("Your name").color(MUTED));
+                            ui.add(egui::TextEdit::singleline(&mut deployer)
+                                .hint_text("Srikar").desired_width(220.0));
+                            ui.end_row();
+
+                            ui.label(RichText::new("New version").color(MUTED));
+                            ui.add(egui::TextEdit::singleline(&mut version)
+                                .font(FontId::monospace(13.0)).desired_width(120.0));
+                            ui.end_row();
+                        });
+
+                    ui.add_space(8.0);
+                    ui.colored_label(MUTED, RichText::new(format!(
+                        "Will compile {} sketch(es) and OTA {} device(s).",
+                        {
+                            let mut dirs = std::collections::HashSet::new();
+                            for d in &self.bulk_deploy.as_ref().unwrap().devices {
+                                dirs.insert(d.sketch_dir.clone());
+                            }
+                            dirs.len()
+                        },
+                        n
+                    )).size(11.0));
+
+                    ui.add_space(12.0);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
+                        let ready = !deployer.trim().is_empty() && !version.trim().is_empty();
+                        let btn = egui::Button::new(RichText::new("Start Deploy").color(Color32::WHITE))
+                            .fill(if ready { PRIMARY } else { MUTED });
+                        if ui.add_enabled(ready, btn).clicked() { do_start = true; }
+                        ui.add_space(8.0);
+                        if ui.button("Cancel").clicked() { do_cancel = true; }
+                    });
+                });
+
+            if let Some(bd) = &mut self.bulk_deploy {
+                bd.form_deployer = deployer.clone();
+                bd.form_version  = version.clone();
+            }
+            if do_start {
+                if let Some(bd) = &mut self.bulk_deploy {
+                    bd.deployer_name = bd.form_deployer.trim().to_string();
+                    bd.new_version   = bd.form_version.trim().to_string();
+                }
+                self.start_bulk_deploy();
+            }
+            if do_cancel {
+                self.bulk_deploy = None;
+            }
+            return;
+        }
+
+        // ── Progress view
+        let bd = self.bulk_deploy.as_ref().unwrap();
+        let devices_snap: Vec<DeviceBulkDeploy> = bd.devices.clone();
+        let done_count = devices_snap.iter().filter(|d| d.phase == DeployPhase::Done).count();
+        let fail_count = devices_snap.iter().filter(|d| matches!(d.phase, DeployPhase::Failed(_))).count();
+        let all_finished = done_count + fail_count == n;
+
+        let mut close = false;
+        egui::Window::new(format!("Bulk Deploy — {} devices", n))
+            .id(egui::Id::new("bulk_progress_win"))
+            .default_size([560.0, 400.0])
+            .collapsible(false)
+            .show(ctx, |ui| {
+                // Summary bar
+                egui::Frame {
+                    fill: SURFACE,
+                    rounding: Rounding::same(4.0),
+                    inner_margin: Margin::symmetric(10.0, 6.0),
+                    ..Default::default()
+                }.show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(format!("Done: {}", done_count)).color(SUCCESS).size(13.0));
+                        ui.add_space(12.0);
+                        let in_progress = n - done_count - fail_count;
+                        ui.label(RichText::new(format!("In progress: {}", in_progress)).color(PRIMARY).size(13.0));
+                        ui.add_space(12.0);
+                        ui.label(RichText::new(format!("Failed: {}", fail_count)).color(DANGER).size(13.0));
+                    });
+                });
+                ui.add_space(8.0);
+
+                egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
+                    for dev in &devices_snap {
+                        let (phase_label, phase_color) = match &dev.phase {
+                            DeployPhase::Form        => ("Queued",     MUTED),
+                            DeployPhase::Compiling   => ("Compiling…", WARNING),
+                            DeployPhase::Uploading   => ("Uploading…", PRIMARY),
+                            DeployPhase::Publishing  => ("Sending OTA…", PRIMARY),
+                            DeployPhase::Waiting     => ("Waiting…",   PRIMARY),
+                            DeployPhase::Done        => ("Done ✓",     SUCCESS),
+                            DeployPhase::Failed(_)   => ("Failed ✗",   DANGER),
+                        };
+                        let progress = match &dev.phase {
+                            DeployPhase::Form        => 0.0f32,
+                            DeployPhase::Compiling   => 0.20,
+                            DeployPhase::Uploading   => 0.45,
+                            DeployPhase::Publishing  => 0.70,
+                            DeployPhase::Waiting     => 0.85,
+                            DeployPhase::Done        => 1.0,
+                            DeployPhase::Failed(_)   => 0.0,
+                        };
+
+                        egui::Frame {
+                            fill: CARD,
+                            stroke: Stroke::new(1.0, BORDER),
+                            rounding: Rounding::same(4.0),
+                            inner_margin: Margin::symmetric(10.0, 6.0),
+                            ..Default::default()
+                        }.show(ui, |ui| {
+                            ui.set_min_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                ui.allocate_ui(egui::vec2(160.0, 0.0), |ui| {
+                                    ui.label(RichText::new(&dev.device_name).size(13.0).color(TEXT));
+                                    ui.label(Self::label_mono(&dev.device_id, MUTED));
+                                });
+                                ui.allocate_ui(egui::vec2(180.0, 20.0), |ui| {
+                                    let bar_color = if matches!(dev.phase, DeployPhase::Failed(_)) { DANGER } else { phase_color };
+                                    let pb = egui::ProgressBar::new(progress)
+                                        .fill(bar_color)
+                                        .desired_width(175.0);
+                                    ui.add(pb);
+                                });
+                                ui.add_space(8.0);
+                                ui.label(RichText::new(phase_label).size(12.0).color(phase_color));
+                            });
+                        });
+                        ui.add_space(3.0);
+                    }
+                });
+
+                ui.add_space(8.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
+                    let btn = egui::Button::new(RichText::new("Close").color(Color32::WHITE))
+                        .fill(if all_finished { PRIMARY } else { MUTED });
+                    if ui.add_enabled(all_finished, btn).clicked() { close = true; }
+                    if !all_finished {
+                        ui.add_space(8.0);
+                        ui.colored_label(MUTED, RichText::new("Close available when all devices finish").size(11.0));
+                    }
+                });
+            });
+
+        if close {
+            self.bulk_deploy = None;
+            self.selected.clear();
+        }
+
+        if !all_finished {
+            ctx.request_repaint_after(std::time::Duration::from_millis(300));
+        }
     }
 }
 

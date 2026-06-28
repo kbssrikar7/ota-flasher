@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,6 +27,8 @@ pub struct Device {
     pub added_by: String,
     #[serde(default)]
     pub added_at: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -84,6 +87,7 @@ pub enum LogLevel {
     Error,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum AppEvent {
     MqttConnected,
@@ -97,6 +101,9 @@ pub enum AppEvent {
     OtaPublished,
     FolderPicked { context: FolderPickCtx, path: PathBuf },
     Error(String),
+    BulkCompileDone { sketch_dir: String, success: bool, bin_path: Option<PathBuf> },
+    BulkUploadDone { sketch_dir: String, url: String },
+    BulkOtaPublished { device_id: String },
 }
 
 #[derive(Debug, Clone)]
@@ -105,6 +112,9 @@ pub enum FolderPickCtx {
     AddDeviceSketch,
     SettingsSketchRoot,
 }
+
+#[derive(Default, Debug, Clone, PartialEq, Copy)]
+pub enum ViewMode { #[default] Cards, List }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum DeployPhase {
@@ -115,4 +125,38 @@ pub enum DeployPhase {
     Waiting,
     Done,
     Failed(String),
+}
+
+// ─── Bulk deploy types ────────────────────────────────────────────────────────
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq)]
+pub enum SketchBuildState {
+    Pending,
+    Compiling,
+    Done(PathBuf),
+    Uploading,
+    Uploaded(String),
+    Failed(String),
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct DeviceBulkDeploy {
+    pub device_id: String,
+    pub device_name: String,
+    pub sketch_dir: String,
+    pub phase: DeployPhase,
+    pub log: Vec<(String, LogLevel)>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BulkDeployState {
+    pub deployer_name: String,
+    pub new_version: String,
+    pub devices: Vec<DeviceBulkDeploy>,
+    pub sketch_builds: HashMap<String, SketchBuildState>,
+    pub form_deployer: String,
+    pub form_version: String,
+    pub show_form: bool,
 }
