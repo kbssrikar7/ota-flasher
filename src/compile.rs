@@ -33,6 +33,24 @@ fn send_log(
     ctx.request_repaint();
 }
 
+fn find_arduino_cli() -> String {
+    let candidates = [
+        dirs::home_dir()
+            .map(|h| h.join(".local/bin/arduino-cli").to_string_lossy().to_string())
+            .unwrap_or_default(),
+        "/usr/local/bin/arduino-cli".to_string(),
+        "/usr/bin/arduino-cli".to_string(),
+        "arduino-cli".to_string(), // fallback: rely on PATH
+    ];
+    for path in &candidates {
+        if path.is_empty() { continue; }
+        if std::path::Path::new(path).exists() || path == "arduino-cli" {
+            return path.clone();
+        }
+    }
+    "arduino-cli".to_string()
+}
+
 pub fn compile_sketch(
     sketch_dir: String,
     new_version: String,
@@ -73,14 +91,15 @@ pub fn compile_sketch(
         return;
     }
 
+    let arduino_cli = find_arduino_cli();
     send_log(
         &tx,
         &ctx,
-        format!("$ arduino-cli compile --fqbn {} --output-dir {} {}", fqbn, tmp.display(), sketch_dir),
+        format!("$ {} compile --fqbn {} --output-dir {} {}", arduino_cli, fqbn, tmp.display(), sketch_dir),
         LogLevel::Info,
     );
 
-    let mut child = match Command::new("arduino-cli")
+    let mut child = match Command::new(&arduino_cli)
         .args([
             "compile",
             "--fqbn",
@@ -95,7 +114,7 @@ pub fn compile_sketch(
     {
         Ok(c) => c,
         Err(e) => {
-            send_log(&tx, &ctx, format!("Failed to launch arduino-cli: {}", e), LogLevel::Error);
+            send_log(&tx, &ctx, format!("Failed to launch arduino-cli ({}): {}", arduino_cli, e), LogLevel::Error);
             send_log(&tx, &ctx, "Install it: https://arduino.github.io/arduino-cli/latest/installation/", LogLevel::Info);
             tx.send(AppEvent::CompileDone { success: false, bin_path: None }).ok();
             ctx.request_repaint();

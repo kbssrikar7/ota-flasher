@@ -1,4 +1,4 @@
-use rumqttc::{Client, Event, MqttOptions, Packet, QoS, TlsConfiguration, Transport};
+use rumqttc::{Client, ConnAck, Event, MqttOptions, Packet, QoS, TlsConfiguration, Transport};
 use std::sync::{Arc, Mutex};
 use crate::types::{AppConfig, AppEvent};
 
@@ -25,18 +25,26 @@ pub fn run_mqtt(
     let (client, mut connection) = Client::new(opts, 20);
     *client_arc.lock().unwrap() = Some(client.clone());
 
-    if let Err(e) = client.subscribe("solar/+/status", QoS::AtLeastOnce) {
-        tx.send(AppEvent::MqttDisconnected(e.to_string())).ok();
+    if let Err(_) = client.subscribe("solar/+/status", QoS::AtLeastOnce) {
+        tx.send(AppEvent::MqttDisconnected).ok();
         *client_arc.lock().unwrap() = None;
         ctx.request_repaint();
         return;
     }
 
-    tx.send(AppEvent::MqttConnected).ok();
-    ctx.request_repaint();
-
     for notification in connection.iter() {
         match notification {
+            Ok(Event::Incoming(Packet::ConnAck(ConnAck { code, .. }))) => {
+                if code == rumqttc::ConnectReturnCode::Success {
+                    tx.send(AppEvent::MqttConnected).ok();
+                    ctx.request_repaint();
+                } else {
+                    tx.send(AppEvent::MqttDisconnected).ok();
+                    *client_arc.lock().unwrap() = None;
+                    ctx.request_repaint();
+                    break;
+                }
+            }
             Ok(Event::Incoming(Packet::Publish(p))) => {
                 let payload = String::from_utf8_lossy(&p.payload).to_string();
                 let parts: Vec<&str> = p.topic.split('/').collect();
@@ -49,8 +57,8 @@ pub fn run_mqtt(
                     ctx.request_repaint();
                 }
             }
-            Err(e) => {
-                tx.send(AppEvent::MqttDisconnected(e.to_string())).ok();
+            Err(_) => {
+                tx.send(AppEvent::MqttDisconnected).ok();
                 *client_arc.lock().unwrap() = None;
                 ctx.request_repaint();
                 break;

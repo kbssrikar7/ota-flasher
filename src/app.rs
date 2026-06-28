@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     path::PathBuf,
-    sync::{Arc, Mutex, mpsc},
+    sync::{Arc, Mutex, mpsc, atomic::{AtomicBool, AtomicU64, Ordering}},
     time::Instant,
 };
 use egui::{Color32, FontFamily, FontId, RichText, Stroke, Margin, Rounding};
@@ -85,7 +85,8 @@ pub struct App {
     show_settings: bool,
     settings_buf: AppConfig,
     notif: Option<Notif>,
-    picking_folder: bool,
+    picking_folder: Arc<AtomicBool>,
+    mqtt_gen: Arc<AtomicU64>,
     first_run: bool,
 }
 
@@ -118,7 +119,8 @@ impl App {
             add_form: AddForm::default(),
             show_settings: needs_setup,
             notif: None,
-            picking_folder: false,
+            picking_folder: Arc::new(AtomicBool::new(false)),
+            mqtt_gen: Arc::new(AtomicU64::new(0)),
             first_run: needs_setup,
         };
 
@@ -217,15 +219,17 @@ impl App {
     }
 
     fn pick_folder(&mut self, ctx_field: FolderPickCtx) {
-        if self.picking_folder { return; }
-        self.picking_folder = true;
+        if self.picking_folder.load(Ordering::SeqCst) { return; }
+        self.picking_folder.store(true, Ordering::SeqCst);
 
-        let tx  = self.event_tx.clone();
-        let ctx = self.egui_ctx.clone();
+        let flag = self.picking_folder.clone();
+        let tx   = self.event_tx.clone();
+        let ctx  = self.egui_ctx.clone();
         std::thread::spawn(move || {
             let picked = rfd::FileDialog::new()
                 .set_title("Select folder")
                 .pick_folder();
+            flag.store(false, Ordering::SeqCst); // always reset, even on cancel
             if let Some(path) = picked {
                 tx.send(AppEvent::FolderPicked { context: ctx_field, path }).ok();
                 ctx.request_repaint();
@@ -252,18 +256,21 @@ impl App {
                 AppEvent::MqttConnected => {
                     self.mqtt_connected = true;
                 }
-                AppEvent::MqttDisconnected(e) => {
+                AppEvent::MqttDisconnected => {
                     self.mqtt_connected = false;
-                    // Reconnect after short delay
-                    let cfg = self.config.clone();
-                    let arc = self.mqtt_client.clone();
-                    let tx  = self.event_tx.clone();
-                    let ctx = self.egui_ctx.clone();
+                    let gen = self.mqtt_gen.fetch_add(1, Ordering::SeqCst) + 1;
+                    let cfg     = self.config.clone();
+                    let arc     = self.mqtt_client.clone();
+                    let tx      = self.event_tx.clone();
+                    let ctx     = self.egui_ctx.clone();
+                    let gen_arc = self.mqtt_gen.clone();
                     std::thread::spawn(move || {
                         std::thread::sleep(std::time::Duration::from_secs(5));
-                        run_mqtt(cfg, arc, tx, ctx);
+                        // Only reconnect if we are still the latest generation
+                        if gen_arc.load(Ordering::SeqCst) == gen {
+                            run_mqtt(cfg, arc, tx, ctx);
+                        }
                     });
-                    let _ = e; // connection error logged silently
                 }
                 AppEvent::MqttStatus { device_id, status } => {
                     self.mqtt_status.insert(device_id.clone(), status.clone());
@@ -365,7 +372,7 @@ impl App {
                     }
                 }
                 AppEvent::FolderPicked { context, path } => {
-                    self.picking_folder = false;
+                    // flag already reset in the spawn thread; this is a no-op safety net
                     let s = path.to_string_lossy().to_string();
                     match context {
                         FolderPickCtx::DeploySketch => {
@@ -386,7 +393,7 @@ impl App {
                             d.phase = DeployPhase::Failed(e);
                         }
                     }
-                    self.picking_folder = false;
+                    self.picking_folder.store(false, Ordering::SeqCst);
                 }
             }
         }
@@ -588,7 +595,7 @@ impl App {
                         ui.label(RichText::new(&device.company).size(11.0).color(MUTED));
                     }
                 });
-                let (dot, col) = if is_online { ("●", SUCCESS) } else { ("○", MUTED) };
+                let (dot, col) = if is_online { ("[+]", SUCCESS) } else { ("[ ]", MUTED) };
                 ui.colored_label(col, RichText::new(format!("{} {}", dot, if is_online { "Online" } else { "Offline" })).size(12.0));
             });
 
@@ -1126,6 +1133,7 @@ impl App {
             self.notify("Settings saved. Reconnecting MQTT…", false);
             *self.mqtt_client.lock().unwrap() = None;
             self.mqtt_connected = false;
+            self.mqtt_gen.fetch_add(1, Ordering::SeqCst); // cancel pending reconnect threads
             let cfg  = self.config.clone();
             let arc  = self.mqtt_client.clone();
             let tx   = self.event_tx.clone();

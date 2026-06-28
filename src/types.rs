@@ -87,7 +87,7 @@ pub enum LogLevel {
 #[derive(Debug, Clone)]
 pub enum AppEvent {
     MqttConnected,
-    MqttDisconnected(String),
+    MqttDisconnected,
     MqttStatus { device_id: String, status: String },
     FleetLoaded(FleetState),
     FleetSaved,
