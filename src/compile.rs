@@ -66,6 +66,22 @@ pub fn compile_sketch(
 
     let ino_path = Path::new(&sketch_dir).join(format!("{}.ino", sketch_name));
 
+    // Validate sketch folder and .ino exist before doing anything
+    if !Path::new(&sketch_dir).is_dir() {
+        send_log(&tx, &ctx, format!("Error: sketch folder not found: {}", sketch_dir), LogLevel::Error);
+        send_log(&tx, &ctx, "→ Set Sketch folder to your Arduino sketch directory, e.g. ~/Arduino/ESP32_VIT010_MQTT_TLS", LogLevel::Info);
+        tx.send(AppEvent::CompileDone { success: false, bin_path: None }).ok();
+        ctx.request_repaint();
+        return;
+    }
+    if !ino_path.exists() {
+        send_log(&tx, &ctx, format!("Error: .ino not found at {}", ino_path.display()), LogLevel::Error);
+        send_log(&tx, &ctx, format!("→ The folder name '{}' must match the .ino filename inside it", sketch_name), LogLevel::Info);
+        tx.send(AppEvent::CompileDone { success: false, bin_path: None }).ok();
+        ctx.request_repaint();
+        return;
+    }
+
     // Bump FIRMWARE_VERSION
     send_log(&tx, &ctx, format!("Bumping FIRMWARE_VERSION to {} in {}", new_version, ino_path.display()), LogLevel::Info);
     match bump_firmware_version(&ino_path, &new_version) {

@@ -40,10 +40,15 @@ pub async fn upload_firmware(
     version: String,
     worker_url: String,
     token: String,
+    vps_host: String,
+    vps_key: String,
+    vps_firmware_dir: String,
+    vps_firmware_url: String,
 ) -> Result<String, String> {
-    let bytes = tokio::fs::read(&bin_path).await.map_err(|e| e.to_string())?;
     let filename = format!("{}_v{}.bin", device_id, version);
+    let bytes = tokio::fs::read(&bin_path).await.map_err(|e| e.to_string())?;
 
+    // 1. Upload to Cloudflare R2 for fleet records and backup storage
     let part = reqwest::multipart::Part::bytes(bytes)
         .file_name(filename.clone())
         .mime_str("application/octet-stream")
@@ -66,11 +71,44 @@ pub async fn upload_firmware(
         return Err(format!("HTTP {} uploading firmware", http_resp.status()));
     }
 
-    let resp: serde_json::Value = http_resp.json().await.map_err(|e| e.to_string())?;
-
-    resp["url"]
+    let cf_resp: serde_json::Value = http_resp.json().await.map_err(|e| e.to_string())?;
+    let cf_url = cf_resp["url"]
         .as_str()
-        .ok_or_else(|| format!("No url in response: {:?}", resp))
-        .map(|s| s.to_string())
-}
+        .ok_or_else(|| format!("No url in Cloudflare response: {:?}", cf_resp))?
+        .to_string();
 
+    // 2. SCP to VPS for reliable HTTP delivery to ESP32.
+    //    ESP32 TLS times out on large binaries downloaded over HTTPS from Cloudflare.
+    if !vps_host.is_empty() && !vps_key.is_empty() {
+        let remote = format!("{}:{}/{}", vps_host, vps_firmware_dir, filename);
+        let bin_str = bin_path.to_string_lossy().to_string();
+        let key = vps_key.clone();
+        let out = tokio::task::spawn_blocking(move || {
+            std::process::Command::new("scp")
+                .args([
+                    "-i", &key,
+                    "-o", "StrictHostKeyChecking=no",
+                    "-o", "BatchMode=yes",
+                    &bin_str,
+                    &remote,
+                ])
+                .output()
+        })
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| format!("scp launch failed: {}", e))?;
+
+        if !out.status.success() {
+            return Err(format!(
+                "SCP to VPS failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+
+        // Return VPS HTTP URL — no TLS, works reliably with ESP32 HTTPUpdate
+        return Ok(format!("{}/{}", vps_firmware_url.trim_end_matches('/'), filename));
+    }
+
+    // Fallback: VPS not configured, use Cloudflare URL
+    Ok(cf_url)
+}

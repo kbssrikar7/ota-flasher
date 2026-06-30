@@ -90,7 +90,6 @@ pub struct App {
     mqtt_gen: Arc<AtomicU64>,
     first_run: bool,
     search_query: String,
-    view_mode: ViewMode,
     selected: HashSet<String>,
     bulk_deploy: Option<BulkDeployState>,
 }
@@ -128,7 +127,6 @@ impl App {
             mqtt_gen: Arc::new(AtomicU64::new(0)),
             first_run: needs_setup,
             search_query: String::new(),
-            view_mode: ViewMode::Cards,
             selected: HashSet::new(),
             bulk_deploy: None,
         };
@@ -413,17 +411,21 @@ impl App {
                         if success {
                             d.phase = DeployPhase::Uploading;
                             d.bin_path = bin_path.clone();
-                            d.log_lines.push(("Uploading to Cloudflare R2…".to_string(), LogLevel::Info));
+                            d.log_lines.push(("Uploading to Cloudflare R2 + VPS…".to_string(), LogLevel::Info));
 
-                            let tx  = self.event_tx.clone();
-                            let ctx = self.egui_ctx.clone();
-                            let bin = bin_path.unwrap();
-                            let did = d.device_id.clone();
-                            let ver = d.new_version.clone();
-                            let url = self.config.worker_url.clone();
-                            let tok = self.config.worker_token.clone();
+                            let tx   = self.event_tx.clone();
+                            let ctx  = self.egui_ctx.clone();
+                            let bin  = bin_path.unwrap();
+                            let did  = d.device_id.clone();
+                            let ver  = d.new_version.clone();
+                            let url  = self.config.worker_url.clone();
+                            let tok  = self.config.worker_token.clone();
+                            let vh   = self.config.vps_host.clone();
+                            let vk   = self.config.vps_key.clone();
+                            let vd   = self.config.vps_firmware_dir.clone();
+                            let vu   = self.config.vps_firmware_url.clone();
                             self.rt.spawn(async move {
-                                match worker::upload_firmware(bin, did, ver, url, tok).await {
+                                match worker::upload_firmware(bin, did, ver, url, tok, vh, vk, vd, vu).await {
                                     Ok(u)  => { tx.send(AppEvent::UploadDone { url: u }).ok(); }
                                     Err(e) => { tx.send(AppEvent::Error(format!("Upload: {}", e))).ok(); }
                                 }
@@ -516,12 +518,16 @@ impl App {
                                     .file_name()
                                     .map(|n| n.to_string_lossy().to_string())
                                     .unwrap_or_else(|| "sketch".to_string());
-                                let version = bd.new_version.clone();
-                                let worker_url = self.config.worker_url.clone();
-                                let token = self.config.worker_token.clone();
+                                let version     = bd.new_version.clone();
+                                let worker_url  = self.config.worker_url.clone();
+                                let token       = self.config.worker_token.clone();
+                                let vh          = self.config.vps_host.clone();
+                                let vk          = self.config.vps_key.clone();
+                                let vd          = self.config.vps_firmware_dir.clone();
+                                let vu          = self.config.vps_firmware_url.clone();
                                 let sketch_dir2 = sketch_dir.clone();
                                 self.rt.spawn(async move {
-                                    match worker::upload_firmware(path, sketch_name, version, worker_url, token).await {
+                                    match worker::upload_firmware(path, sketch_name, version, worker_url, token, vh, vk, vd, vu).await {
                                         Ok(url) => { tx2.send(AppEvent::BulkUploadDone { sketch_dir: sketch_dir2, url }).ok(); }
                                         Err(e)  => { tx2.send(AppEvent::Error(format!("Bulk upload: {}", e))).ok(); }
                                     }
@@ -733,7 +739,7 @@ impl App {
         ui.add_space(10.0);
     }
 
-    // ── Search bar + view toggle ──────────────────────────────────────────────
+    // ── Search bar ───────────────────────────────────────────────────────────
 
     fn render_toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
@@ -747,23 +753,6 @@ impl App {
                     self.search_query.clear();
                 }
             }
-
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let list_active = self.view_mode == ViewMode::List;
-                let card_active = self.view_mode == ViewMode::Cards;
-
-                let list_btn = egui::Button::new(RichText::new("List").size(12.0))
-                    .fill(if list_active { PRIMARY } else { SURFACE })
-                    .stroke(Stroke::new(1.0, if list_active { PRIMARY } else { BORDER }));
-                if ui.add(list_btn).clicked() { self.view_mode = ViewMode::List; }
-
-                let card_btn = egui::Button::new(RichText::new("Cards").size(12.0))
-                    .fill(if card_active { PRIMARY } else { SURFACE })
-                    .stroke(Stroke::new(1.0, if card_active { PRIMARY } else { BORDER }));
-                if ui.add(card_btn).clicked() { self.view_mode = ViewMode::Cards; }
-
-                ui.label(RichText::new("View:").size(12.0).color(MUTED));
-            });
         });
         ui.add_space(10.0);
     }
@@ -803,33 +792,7 @@ impl App {
             return;
         }
 
-        if self.view_mode == ViewMode::List {
-            self.render_devices_list(ui, &devices);
-            return;
-        }
-
-        let available_w = ui.available_width();
-        let cols = if available_w > 760.0 { 2usize } else { 1 };
-        let gap = 12.0;
-        let card_w = (available_w - gap * (cols as f32 - 1.0)) / cols as f32;
-
-        for chunk in devices.chunks(cols) {
-            ui.horizontal(|ui| {
-                for (i, device) in chunk.iter().enumerate() {
-                    if i > 0 { ui.add_space(gap); }
-                    // Force vertical layout inside each card slot so the frame
-                    // doesn't inherit the surrounding horizontal context.
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(card_w, 0.0),
-                        egui::Layout::top_down(egui::Align::LEFT),
-                        |ui| {
-                            self.render_device_card(ui, device);
-                        },
-                    );
-                }
-            });
-            ui.add_space(10.0);
-        }
+        self.render_devices_list(ui, &devices);
     }
 
     fn render_devices_list(&mut self, ui: &mut egui::Ui, devices: &[Device]) {
@@ -990,86 +953,6 @@ impl App {
                 });
                 ui.add_space(2.0);
             }
-        });
-    }
-
-    fn render_device_card(&mut self, ui: &mut egui::Ui, device: &Device) {
-        let raw_status = self.mqtt_status.get(&device.id).cloned().unwrap_or_default();
-        let is_online  = raw_status.starts_with("ONLINE");
-        let reported   = parse_version_from_status(&raw_status);
-        let card_w     = ui.available_width();
-
-        Self::card_frame().show(ui, |ui| {
-            // ── Header row: name left, online status right
-            ui.horizontal(|ui| {
-                let left_w = (card_w - 32.0 - 80.0).max(100.0); // card minus margins minus status
-                ui.allocate_ui(egui::vec2(left_w, 0.0), |ui| {
-                    ui.label(RichText::new(&device.name).size(15.0).strong().color(TEXT));
-                    if !device.company.is_empty() {
-                        ui.label(RichText::new(&device.company).size(11.0).color(MUTED));
-                    }
-                });
-                let (dot, col) = if is_online { ("[+]", SUCCESS) } else { ("[ ]", MUTED) };
-                ui.colored_label(col, RichText::new(format!("{} {}", dot, if is_online { "Online" } else { "Offline" })).size(12.0));
-            });
-
-            ui.add_space(4.0);
-            ui.label(Self::label_mono(format!("solar/{}/…", device.id), MUTED));
-            if !device.tags.is_empty() {
-                ui.add_space(4.0);
-                ui.horizontal_wrapped(|ui| {
-                    ui.spacing_mut().item_spacing.x = 4.0;
-                    for tag in &device.tags {
-                        egui::Frame {
-                            fill: Color32::from_rgb(40, 60, 100),
-                            rounding: Rounding::same(3.0),
-                            inner_margin: Margin::symmetric(5.0, 2.0),
-                            ..Default::default()
-                        }.show(ui, |ui| {
-                            ui.label(RichText::new(tag).size(10.0).color(PRIMARY));
-                        });
-                    }
-                });
-            }
-            ui.add_space(10.0);
-            ui.separator();
-            ui.add_space(8.0);
-
-            // ── Version info: flat single line to avoid layout collapse
-            let deployed = if device.desired_version.is_empty() {
-                "—".to_string()
-            } else {
-                format!("v{}", device.desired_version)
-            };
-            ui.horizontal(|ui| {
-                ui.colored_label(MUTED, RichText::new("Deployed:").size(11.0));
-                ui.label(Self::label_mono(&deployed, TEXT));
-                ui.add_space(14.0);
-                ui.colored_label(MUTED, RichText::new("Running:").size(11.0));
-                if let Some(rv) = &reported {
-                    let same = rv == &device.desired_version;
-                    let (col, mark) = if same { (SUCCESS, " ✓") } else { (WARNING, " ⚠") };
-                    ui.label(Self::label_mono(format!("v{}{}", rv, mark), col));
-                } else {
-                    ui.label(Self::label_mono("—", MUTED));
-                }
-            });
-
-            if !device.last_deploy_by.is_empty() {
-                ui.add_space(2.0);
-                ui.colored_label(MUTED, RichText::new(format!("Last by {}", device.last_deploy_by)).size(11.0));
-            }
-
-            ui.add_space(12.0);
-
-            // ── Deploy button
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::BOTTOM), |ui| {
-                let btn = egui::Button::new(RichText::new("Deploy").color(Color32::WHITE)).fill(PRIMARY);
-                if ui.add(btn).clicked() {
-                    let dev = device.clone();
-                    self.open_deploy(&dev);
-                }
-            });
         });
     }
 
@@ -1539,6 +1422,33 @@ impl App {
                     };
                     ui.label(pass_label);
                     ui.add(egui::TextEdit::singleline(&mut s.mqtt_pass).password(true).desired_width(180.0));
+                    ui.end_row();
+                });
+
+                ui.add_space(10.0);
+                section_header(ui, "VPS Firmware Delivery");
+                ui.colored_label(MUTED, RichText::new("Firmware is served over plain HTTP from your VPS — avoids ESP32 TLS timeout on large binaries.").size(11.0));
+                ui.add_space(6.0);
+                egui::Grid::new("vps_grid").num_columns(2).spacing([10.0, 7.0]).show(ui, |ui| {
+                    ui.label(RichText::new("VPS host").color(MUTED));
+                    ui.add(egui::TextEdit::singleline(&mut s.vps_host)
+                        .font(FontId::monospace(12.0)).desired_width(240.0)
+                        .hint_text("root@1.2.3.4"));
+                    ui.end_row();
+                    ui.label(RichText::new("SSH key path").color(MUTED));
+                    ui.add(egui::TextEdit::singleline(&mut s.vps_key)
+                        .font(FontId::new(11.0, FontFamily::Monospace)).desired_width(240.0)
+                        .hint_text("~/.ssh/id_rsa"));
+                    ui.end_row();
+                    ui.label(RichText::new("Firmware dir").color(MUTED));
+                    ui.add(egui::TextEdit::singleline(&mut s.vps_firmware_dir)
+                        .font(FontId::monospace(12.0)).desired_width(240.0)
+                        .hint_text("/var/www/firmware"));
+                    ui.end_row();
+                    ui.label(RichText::new("Firmware URL base").color(MUTED));
+                    ui.add(egui::TextEdit::singleline(&mut s.vps_firmware_url)
+                        .font(FontId::monospace(12.0)).desired_width(240.0)
+                        .hint_text("http://your-vps/firmware"));
                     ui.end_row();
                 });
 

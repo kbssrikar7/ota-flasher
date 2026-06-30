@@ -60,6 +60,15 @@ pub struct AppConfig {
     pub mqtt_port: u16,
     pub mqtt_user: String,
     pub mqtt_pass: String,
+    // VPS firmware delivery (HTTP — avoids ESP32 TLS timeout on large binaries)
+    #[serde(default)]
+    pub vps_host: String,
+    #[serde(default)]
+    pub vps_key: String,
+    #[serde(default)]
+    pub vps_firmware_dir: String,
+    #[serde(default)]
+    pub vps_firmware_url: String,
 }
 
 impl Default for AppConfig {
@@ -75,6 +84,12 @@ impl Default for AppConfig {
             mqtt_port: 8883,
             mqtt_user: "solar".to_string(),
             mqtt_pass: String::new(),
+            vps_host: "root@88.222.241.205".to_string(),
+            vps_key: dirs::home_dir()
+                .map(|h| h.join(".ssh/hostinger_solar_vps").to_string_lossy().to_string())
+                .unwrap_or_default(),
+            vps_firmware_dir: "/var/www/firmware".to_string(),
+            vps_firmware_url: "http://mqtt.vitalitysoft.com/firmware".to_string(),
         }
     }
 }
@@ -112,9 +127,6 @@ pub enum FolderPickCtx {
     AddDeviceSketch,
     SettingsSketchRoot,
 }
-
-#[derive(Default, Debug, Clone, PartialEq, Copy)]
-pub enum ViewMode { #[default] Cards, List }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum DeployPhase {
